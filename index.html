@@ -287,7 +287,7 @@
   .col-edit.col-drop-left  { box-shadow: -3px 0 0 #4f7cf6; }
   .col-edit.col-drop-right { box-shadow:  3px 0 0 #4f7cf6; }
 
-  /* 두벽면(ㄱ자) 분할 경계 */
+  /* 벽면 분할 경계 (최대 2곳 → 벽면 A/B/C) */
   .wall-divider {
     flex: 0 0 14px; align-self: stretch; margin: 0 1px; border-radius: 5px;
     cursor: pointer; display: flex; align-items: center; justify-content: center;
@@ -301,6 +301,8 @@
     border: 2px solid #fb923c; color: #9a3412; font-weight: 700;
   }
   .wall-divider.active:hover { border-color: #ea580c; }
+  .wall-divider.disabled { opacity: 0.4; cursor: not-allowed; }
+  .wall-divider.disabled:hover { background: #f1f3f7; border-color: #cbd5e1; color: #94a3b8; }
 
   /* 도면 상단 고정 (편집하며 보기) */
   .diagram-card.pinned {
@@ -1444,11 +1446,11 @@ function parsePatternFromName(name) {
   return { pattern, width, doorMode, isSystem };
 }
 
-// 엔드패널 상태 (좌/우 슬롯)
-// EP 슬롯: left/right = 전체 양끝. midLeft/midRight = 두벽면 분할 시 벽면A 오른끝/벽면B 왼끝.
-// (분할 = 코너형일 수도, 맞은편 벽 설치일 수도 있어 네 끝 모두 EP 가능)
-let currentEPs = { left: null, right: null, midLeft: null, midRight: null };
-const EP_SLOT_KEYS = { 'left-ep': 'left', 'right-ep': 'right', 'mid-left-ep': 'midLeft', 'mid-right-ep': 'midRight' };
+// 엔드패널 상태 (좌/우 슬롯 + 분할 경계별 mid 슬롯)
+// EP 슬롯: left/right = 전체 양끝. mid{N}Left/mid{N}Right = N번째 분할 경계의 좌/우 끝.
+// 분할은 최대 2곳(벽면 A/B/C) → 경계 rank 0=mid1, 1=mid2. (코너형/맞은편 모두 EP 가능)
+let currentEPs = { left: null, right: null, mid1Left: null, mid1Right: null, mid2Left: null, mid2Right: null };
+const EP_SLOT_KEYS = { 'left-ep': 'left', 'right-ep': 'right', 'mid1-left-ep': 'mid1Left', 'mid1-right-ep': 'mid1Right', 'mid2-left-ep': 'mid2Left', 'mid2-right-ep': 'mid2Right' };
 
 const EXAMPLES = {
   1: `100111564
@@ -1954,11 +1956,12 @@ function parseInput(text) {
 // ====================== 평탄 SKU 리스트 → 컬럼 자동 분리 ======================
 function autoSplit(skus) {
   // 1) 타입별로 분류
-  const byType = { door:[], glass:[], mirror:[], body:[], open:[], drawer:[], flap:[], base:[], rod:[], shelf:[], accessory:[], unknown:[] };
+  const byType = { door:[], glass:[], mirror:[], body:[], open:[], drawer:[], flap:[], base:[], rod:[], shelf:[], accessory:[], ep:[], unknown:[] };
   for (const sku of skus) {
     const info = SKU_DB[sku];
     if (!info) { byType.unknown.push(sku); continue; }
-    byType[info.type].push(sku);
+    // byType 에 없는 타입(미래 신규 타입 등)도 크래시 없이 보존
+    (byType[info.type] || byType.unknown).push(sku);
   }
 
   const bases = byType.base;
@@ -2049,6 +2052,10 @@ function autoSplit(skus) {
 
   // 8) 미등록 SKU는 첫 컬럼에 표시 (사용자 확인용)
   for (const sku of byType.unknown) columns[0].skus.push(sku);
+
+  // 9) EP(엔드패널)는 컬럼 부품이 아니므로 첫 컬럼에 보존만 한다.
+  //    이후 extractEndPanelsFromColumns 가 EP 슬롯으로 분리하므로 여기선 누락만 방지.
+  for (const sku of byType.ep) columns[0].skus.push(sku);
 
   return columns.map(c => c.skus);
 }
@@ -2221,10 +2228,13 @@ function renderDiagram(columns) {
   if (!columns.length) return '';
   const SCALE = 0.25, TIER_H = 90, COL_GAP = 4, BASE_H = 22, TITLE_H = 30;
   const EP_W = 8;
-  const CORNER_GAP = 30; // 두벽면 분할 시 분리 표시 폭
-  const splitIdx = effectiveWallSplit(columns);
-  const cornerExtra = splitIdx == null ? 0
-    : CORNER_GAP + (currentEPs.midLeft ? COL_GAP + EP_W : 0) + (currentEPs.midRight ? EP_W : 0);
+  const CORNER_GAP = 30; // 벽면 분할 시 분리 표시 폭
+  const splits = effectiveWallSplits(columns);
+  let cornerExtra = 0;
+  splits.forEach((b, rank) => {
+    const k = midEpKeys(rank);
+    cornerExtra += CORNER_GAP + (currentEPs[k.left] ? COL_GAP + EP_W : 0) + (currentEPs[k.right] ? EP_W : 0);
+  });
   const epExtra = (currentEPs.left ? EP_W + COL_GAP : 0) + (currentEPs.right ? EP_W + COL_GAP : 0);
   const drawingWidth = columns.reduce((s,c)=>s + c.width*SCALE, 0) + COL_GAP * (columns.length-1) + epExtra + cornerExtra;
   const drawingHeight = TIER_H*5 + BASE_H;
@@ -2299,9 +2309,10 @@ function renderSection(columns, sx, sy, scale, tierH, gap, baseH, mode) {
   const EP_W = 8; // EP 시각 폭 (px)
   const CORNER_GAP = 30;
   const colHeight = tierH * 5 + baseH;
-  const splitIdx = effectiveWallSplit(columns);
+  const splits = effectiveWallSplits(columns);
   let out = '', x = sx;
-  let wallAStartX = null, wallBStartX = null, wallAEndX = null, wallBEndX = null;
+  const segSpans = [];          // {seg, startX, endX} — 벽면 A/B/C 라벨용
+  let segStartX = null, curSeg = 0;
 
   // 좌측 EP
   if (currentEPs.left) {
@@ -2314,16 +2325,12 @@ function renderSection(columns, sx, sy, scale, tierH, gap, baseH, mode) {
   for (let ci = 0; ci < columns.length; ci++) {
     const col = columns[ci];
     const w = col.width * scale;
-    if (splitIdx != null) {
-      if (ci === 0) wallAStartX = x;
-      if (ci === splitIdx) wallAEndX = x + w;
-      if (ci === splitIdx + 1) wallBStartX = x;
-      if (ci === columns.length - 1) wallBEndX = x + w;
-    }
-    // 힌지 위치: 벽면(분할 구간)별로 양 끝 컬럼은 바깥쪽, 중간은 좌/우 번갈아 (페이브 표준 조립 가이드)
-    // 두벽면 모드: 코너에 닿는 끝 컬럼도 그 벽면의 '끝'으로 취급 → 힌지가 코너 쪽, 손잡이는 코너 반대쪽
-    const gStart = (splitIdx != null && ci > splitIdx) ? splitIdx + 1 : 0;
-    const gEnd   = (splitIdx != null && ci <= splitIdx) ? splitIdx : columns.length - 1;
+    const seg = segmentOf(ci, splits);
+    if (segStartX == null) { segStartX = x; curSeg = seg; }
+    // 힌지 위치: 벽면(세그먼트)별로 양 끝 컬럼은 바깥쪽, 중간은 좌/우 번갈아 (페이브 표준 조립 가이드)
+    // 분할 모드: 코너에 닿는 끝 컬럼도 그 벽면의 '끝'으로 취급 → 힌지가 코너 쪽, 손잡이는 코너 반대쪽
+    const gStart = seg === 0 ? 0 : splits[seg - 1] + 1;
+    const gEnd   = seg < splits.length ? splits[seg] : columns.length - 1;
     const gi = ci - gStart, gLen = gEnd - gStart + 1;
     const hingeSide = (gi === 0) ? 'left'
                     : (gi === gLen - 1) ? 'right'
@@ -2333,9 +2340,12 @@ function renderSection(columns, sx, sy, scale, tierH, gap, baseH, mode) {
     if (col.isEpOnlyCol && col.items.ep && col.items.ep.length > 0) {
       out += renderEPPanel(x, sy, w, tierH * 5, 'mid');
       out += `<text x="${x + w/2}" y="${sy + tierH*5 + 16}" text-anchor="middle" class="lbl t">EP</text>`;
-      if (splitIdx != null && ci === splitIdx) {
-        x = renderWallBoundary(x + w, sy, gap, colHeight, CORNER_GAP, s => { out += s; });
+      if (splits.includes(ci)) {
+        segSpans.push({ seg: curSeg, startX: segStartX, endX: x + w });
+        x = renderWallBoundary(x + w, sy, gap, colHeight, CORNER_GAP, splits.indexOf(ci), s => { out += s; });
+        segStartX = null;
       } else {
+        if (ci === columns.length - 1) segSpans.push({ seg: curSeg, startX: segStartX, endX: x + w });
         x += w + gap;
       }
       continue;
@@ -2366,17 +2376,22 @@ function renderSection(columns, sx, sy, scale, tierH, gap, baseH, mode) {
       // 좌대 없는 일반 컬럼 (부품 단독 등): 폭 라벨만 표시
       out += `<text x="${x + w/2}" y="${sy + tierH*5 + baseH/2 + 16}" text-anchor="middle" class="lbl t">${col.width}mm</text>`;
     }
-    if (splitIdx != null && ci === splitIdx) {
-      x = renderWallBoundary(x + w, sy, gap, colHeight, CORNER_GAP, s => { out += s; });
+    if (splits.includes(ci)) {
+      segSpans.push({ seg: curSeg, startX: segStartX, endX: x + w });
+      x = renderWallBoundary(x + w, sy, gap, colHeight, CORNER_GAP, splits.indexOf(ci), s => { out += s; });
+      segStartX = null;
     } else {
+      if (ci === columns.length - 1) segSpans.push({ seg: curSeg, startX: segStartX, endX: x + w });
       x += w + gap;
     }
   }
 
-  // 두벽면 모드: 벽면 A/B 라벨
-  if (splitIdx != null && wallAStartX != null && wallBStartX != null) {
-    out += `<text x="${(wallAStartX + wallAEndX) / 2}" y="${sy - 18}" text-anchor="middle" class="lbl" style="fill:#0369a1;font-size:11px;font-weight:700;">벽면 A</text>`;
-    out += `<text x="${(wallBStartX + wallBEndX) / 2}" y="${sy - 18}" text-anchor="middle" class="lbl" style="fill:#9a3412;font-size:11px;font-weight:700;">벽면 B</text>`;
+  // 벽면 라벨 (A/B/C) — 분할이 있을 때만
+  if (splits.length > 0) {
+    for (const span of segSpans) {
+      if (span.startX == null) continue;
+      out += `<text x="${(span.startX + span.endX) / 2}" y="${sy - 18}" text-anchor="middle" class="lbl" style="fill:${SEG_COLORS[span.seg] || '#475569'};font-size:11px;font-weight:700;">벽면 ${SEG_LABELS[span.seg] || (span.seg + 1)}</text>`;
+    }
   }
 
   // 우측 EP
@@ -2393,18 +2408,20 @@ function renderSection(columns, sx, sy, scale, tierH, gap, baseH, mode) {
   return out;
 }
 
-// 분할 경계 렌더: [벽면A 우측 EP] + 분리 스트립 + [벽면B 좌측 EP]. 다음 컬럼 시작 x 반환.
-function renderWallBoundary(xEnd, sy, gap, colHeight, cornerGap, emit) {
+// 분할 경계 렌더: [이전 벽면 우측 EP] + 분리 스트립 + [다음 벽면 좌측 EP]. 다음 컬럼 시작 x 반환.
+// rank = 경계 순번(0,1) → mid1/mid2 EP 슬롯 선택.
+function renderWallBoundary(xEnd, sy, gap, colHeight, cornerGap, rank, emit) {
   const EP_W = 8;
+  const k = midEpKeys(rank);
   let cx = xEnd;
-  if (currentEPs.midLeft) {
+  if (currentEPs[k.left]) {
     cx += gap;
     emit(renderEPPanel(cx, sy, EP_W, colHeight, 'mid-left'));
     cx += EP_W;
   }
   emit(renderCornerStrip(cx, sy, cornerGap, colHeight));
   cx += cornerGap;
-  if (currentEPs.midRight) {
+  if (currentEPs[k.right]) {
     emit(renderEPPanel(cx, sy, EP_W, colHeight, 'mid-right'));
     cx += EP_W;
   }
@@ -2766,20 +2783,44 @@ function validateAll(columns, accessoryCount) {
 
 let currentColumns = null;
 
-// ====================== 두벽면(ㄱ자) 분할 ======================
-// wallSplitIdx = 분할 경계: 컬럼 [0..idx] = 벽면 A, [idx+1..] = 벽면 B. null = 한 벽면.
-// 코너 = 분할 지점 (A의 오른쪽 끝 = B의 왼쪽 끝). 노출면 = A 왼끝·B 오른끝 → 기존 좌/우 EP 슬롯 그대로.
-let wallSplitIdx = null;
+// ====================== 벽면 분할 (최대 2곳 → 벽면 A/B/C) ======================
+// wallSplits = 분할 경계 인덱스 배열(오름차순, 최대 2개). 경계 b → 컬럼 [..b]까지가 한 벽면, [b+1..]이 다음 벽면.
+// 예) [2] → A=[0..2], B=[3..]. [1,3] → A=[0..1], B=[2..3], C=[4..].
+// 노출면 = 첫 벽면 왼끝·마지막 벽면 오른끝 → 좌/우 EP. 각 경계의 좌/우 끝 = mid{rank} EP.
+let wallSplits = [];
+const MAX_WALL_SPLITS = 2;          // 분할 최대 2곳 = 벽면 최대 3개
+const SEG_COLORS = ['#0369a1', '#9a3412', '#047857'];
+const SEG_LABELS = ['A', 'B', 'C'];
 
-// 컬럼 수 변동 시 경계가 범위를 벗어나면 무효 처리
-function effectiveWallSplit(columns) {
-  if (wallSplitIdx == null || !columns) return null;
-  if (wallSplitIdx < 0 || wallSplitIdx >= columns.length - 1) return null;
-  return wallSplitIdx;
+// 컬럼 수 변동 시 범위를 벗어난 경계는 제외하고 정렬·중복제거
+function effectiveWallSplits(columns) {
+  if (!columns) return [];
+  return wallSplits
+    .filter(b => b >= 0 && b < columns.length - 1)
+    .filter((b, i, a) => a.indexOf(b) === i)
+    .sort((a, b) => a - b);
+}
+
+// 경계 rank(0,1) → 해당 mid EP 슬롯 키 묶음
+function midEpKeys(rank) {
+  const n = rank + 1; // mid1 / mid2
+  return { left: `mid${n}Left`, right: `mid${n}Right`, leftSlot: `mid${n}-left-ep`, rightSlot: `mid${n}-right-ep` };
+}
+
+// 컬럼 ci 가 속한 벽면 세그먼트 인덱스 (0=A,1=B,2=C)
+function segmentOf(ci, splits) {
+  return splits.filter(b => ci > b).length;
 }
 
 function toggleWallSplit(boundaryIdx) {
-  wallSplitIdx = (wallSplitIdx === boundaryIdx) ? null : boundaryIdx;
+  if (wallSplits.includes(boundaryIdx)) {
+    wallSplits = wallSplits.filter(b => b !== boundaryIdx);
+  } else if (wallSplits.length < MAX_WALL_SPLITS) {
+    wallSplits = [...wallSplits, boundaryIdx].sort((a, b) => a - b);
+  } else {
+    alert(`벽면은 최대 ${MAX_WALL_SPLITS + 1}개(분할 ${MAX_WALL_SPLITS}곳)까지 가능합니다.\n기존 분할을 해제한 뒤 다른 위치를 분할해 주세요.`);
+    return;
+  }
   refreshAllUI();
 }
 let showHandleGuide = false;
@@ -2830,7 +2871,7 @@ function generate() {
   // 편집 상태 초기화
   stagingParts = [];
   partIdCounter = 0;
-  currentEPs = { left: null, right: null, midLeft: null, midRight: null };
+  currentEPs = { left: null, right: null, mid1Left: null, mid1Right: null, mid2Left: null, mid2Right: null };
   currentColumns = blocks.map((skus, i) => buildColumn(skus, i, (lastParseStats.columnMetas || [])[i] || null));
   // 컬럼에 들어간 EP 부품을 빼내 좌/우 슬롯에 배치 (최대 2개)
   extractEndPanelsFromColumns();
@@ -2962,11 +3003,12 @@ function epSlotHtml(slotId, headerHtml, part) {
 function renderEditor(columns) {
   const editor = document.getElementById('columns-editor');
   if (!editor) return;
-  // 분할 해제 상태에서 중간 EP 슬롯에 남은 EP는 보관함으로 회수
-  if (effectiveWallSplit(columns) == null) {
-    for (const k of ['midLeft', 'midRight']) {
-      if (currentEPs[k]) { stagingParts.push(currentEPs[k]); currentEPs[k] = null; }
-    }
+  // 유효 경계 수보다 많은 mid EP 슬롯에 남은 EP는 보관함으로 회수
+  const splitsE = effectiveWallSplits(columns);
+  const validMidKeys = [];
+  splitsE.forEach((_, rank) => { const k = midEpKeys(rank); validMidKeys.push(k.left, k.right); });
+  for (const k of ['mid1Left', 'mid1Right', 'mid2Left', 'mid2Right']) {
+    if (!validMidKeys.includes(k) && currentEPs[k]) { stagingParts.push(currentEPs[k]); currentEPs[k] = null; }
   }
   let html = '';
 
@@ -2986,9 +3028,10 @@ function renderEditor(columns) {
   html += `<div class="editor-main-row">`;
 
   // 좌측 EP 슬롯
-  const splitIdxForEp = effectiveWallSplit(columns);
+  const splits = splitsE; // 위에서 계산한 유효 경계 배열 재사용
+  const lastSegLabel = SEG_LABELS[splits.length] || SEG_LABELS[SEG_LABELS.length - 1];
   html += `<div class="edge-slot">
-    <div class="edge-slot-header">↤ 좌측 EP${splitIdxForEp != null ? '<br><span style="font-weight:400;color:#0369a1;">(벽면A 좌측)</span>' : ''}</div>
+    <div class="edge-slot-header">↤ 좌측 EP${splits.length > 0 ? `<br><span style="font-weight:400;color:${SEG_COLORS[0]};">(벽면A 좌측)</span>` : ''}</div>
     <div class="edge-slot-drop" data-col="left-ep"
          ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">`;
   if (currentEPs.left) {
@@ -2999,23 +3042,29 @@ function renderEditor(columns) {
   html += `</div></div>`;
 
   // 중앙 컬럼 영역
-  const splitIdx = effectiveWallSplit(columns);
+  const atMaxSplits = splits.length >= MAX_WALL_SPLITS;
   html += `<div class="cols-row" style="flex:1;">`;
   columns.forEach((col, i) => {
-    // 컬럼 사이 분할 경계 (클릭으로 두벽면 분할 토글)
+    // 컬럼 사이 분할 경계 (클릭으로 벽면 분할 토글, 최대 2곳)
     if (i > 0 && columns.length >= 2) {
       const bIdx = i - 1;
-      const isActive = splitIdx === bIdx;
+      const rank = splits.indexOf(bIdx);
+      const isActive = rank >= 0;
       if (isActive) {
-        // 분할 지점: 벽면A 우측 EP + 경계 + 벽면B 좌측 EP (코너형/맞은편 모두 EP 가능)
-        html += epSlotHtml('mid-left-ep', '벽면A<br>우측 EP ↦', currentEPs.midLeft);
-        html += `<div class="wall-divider active" onclick="toggleWallSplit(${bIdx})" title="클릭: 두벽면 분할 해제">분할됨</div>`;
-        html += epSlotHtml('mid-right-ep', '↤ 벽면B<br>좌측 EP', currentEPs.midRight);
+        // 분할 지점: 이전 벽면 우측 EP + 경계 + 다음 벽면 좌측 EP (코너형/맞은편 모두 EP 가능)
+        const k = midEpKeys(rank);
+        const segL = SEG_LABELS[rank], segR = SEG_LABELS[rank + 1];
+        html += epSlotHtml(k.leftSlot, `벽면${segL}<br>우측 EP ↦`, currentEPs[k.left]);
+        html += `<div class="wall-divider active" onclick="toggleWallSplit(${bIdx})" title="클릭: 이 분할 해제">분할됨</div>`;
+        html += epSlotHtml(k.rightSlot, `↤ 벽면${segR}<br>좌측 EP`, currentEPs[k.right]);
+      } else if (atMaxSplits) {
+        html += `<div class="wall-divider disabled" title="벽면은 최대 ${MAX_WALL_SPLITS + 1}개(분할 ${MAX_WALL_SPLITS}곳)까지 — 기존 분할을 먼저 해제하세요">분할</div>`;
       } else {
         html += `<div class="wall-divider" onclick="toggleWallSplit(${bIdx})" title="클릭: 여기서 벽면 분할 (코너형·맞은편 벽 모두)">분할</div>`;
       }
     }
-    const wallTag = splitIdx == null ? '' : (i <= splitIdx ? ' <b style="color:#0369a1;">A</b>' : ' <b style="color:#9a3412;">B</b>');
+    const seg = segmentOf(i, splits);
+    const wallTag = splits.length === 0 ? '' : ` <b style="color:${SEG_COLORS[seg] || '#475569'};">${SEG_LABELS[seg] || (seg + 1)}</b>`;
     const tier = col.tierSum != null ? col.tierSum : 0;
     const tierClass = tier === 5 ? 'ok' : 'fail';
     const leftDisabled = i === 0 ? 'disabled' : '';
@@ -3047,9 +3096,9 @@ function renderEditor(columns) {
   });
   html += `</div>`; // close cols-row
 
-  // 우측 EP 슬롯
+  // 우측 EP 슬롯 (마지막 벽면의 오른쪽 끝)
   html += `<div class="edge-slot">
-    <div class="edge-slot-header">↦ 우측 EP${splitIdxForEp != null ? '<br><span style="font-weight:400;color:#9a3412;">(벽면B 우측)</span>' : ''}</div>
+    <div class="edge-slot-header">↦ 우측 EP${splits.length > 0 ? `<br><span style="font-weight:400;color:${SEG_COLORS[splits.length] || '#475569'};">(벽면${lastSegLabel} 우측)</span>` : ''}</div>
     <div class="edge-slot-drop" data-col="right-ep"
          ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">`;
   if (currentEPs.right) {
