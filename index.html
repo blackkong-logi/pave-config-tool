@@ -303,6 +303,14 @@
   .wall-divider.active:hover { border-color: #ea580c; }
   .wall-divider.disabled { opacity: 0.4; cursor: not-allowed; }
   .wall-divider.disabled:hover { background: #f1f3f7; border-color: #cbd5e1; color: #94a3b8; }
+  /* 컬럼 헤더의 벽면 선택 드롭다운 (알파벳 클릭 → 다른 벽 선택해 이동) */
+  .wall-select {
+    font-size: 11px; font-weight: 800; color: var(--wc, #475569);
+    border: 1.5px solid var(--wc, #cbd5e1); border-radius: 4px;
+    background: #fff; padding: 1px 3px; margin-left: 4px; cursor: pointer;
+    vertical-align: middle; appearance: auto;
+  }
+  .wall-select:hover { background: color-mix(in oklab, var(--wc, #475569) 12%, #fff); }
 
   /* 도면 상단 고정 (편집하며 보기) */
   .diagram-card.pinned {
@@ -3064,7 +3072,19 @@ function renderEditor(columns) {
       }
     }
     const seg = segmentOf(i, splits);
-    const wallTag = splits.length === 0 ? '' : ` <b style="color:${SEG_COLORS[seg] || '#475569'};">${SEG_LABELS[seg] || (seg + 1)}</b>`;
+    let wallTag = '';
+    if (splits.length > 0) {
+      const nWalls = splits.length + 1;
+      let opts = '';
+      for (let w = 0; w < nWalls; w++) {
+        opts += `<option value="${w}" ${w === seg ? 'selected' : ''}>벽 ${SEG_LABELS[w] || (w + 1)}</option>`;
+      }
+      // draggable=false + stopPropagation: 헤더 드래그가 select 조작을 가로채지 않도록
+      wallTag = ` <select class="wall-select" style="--wc:${SEG_COLORS[seg] || '#475569'}" draggable="false"`
+        + ` onmousedown="event.stopPropagation()" onclick="event.stopPropagation()"`
+        + ` onchange="moveColumnToWall(${i}, parseInt(this.value, 10))"`
+        + ` title="다른 벽면 선택 시 이 컬럼이 그 벽면으로 이동합니다">${opts}</select>`;
+    }
     const tier = col.tierSum != null ? col.tierSum : 0;
     const tierClass = tier === 5 ? 'ok' : 'fail';
     const leftDisabled = i === 0 ? 'disabled' : '';
@@ -3303,6 +3323,35 @@ function moveColumn(idx, direction) {
   if (newIdx < 0 || newIdx >= currentColumns.length) return;
   [currentColumns[idx], currentColumns[newIdx]] = [currentColumns[newIdx], currentColumns[idx]];
   currentColumns.forEach((c, i) => c.idx = i);
+  refreshAllUI();
+}
+
+// 컬럼을 선택한 벽면(세그먼트)으로 이동 — 컬럼 헤더의 벽면 드롭다운에서 호출.
+// 벽면별로 컬럼을 안정적으로 재그룹화하고 분할 경계를 다시 계산한다(빈 벽면은 자동 소멸).
+function moveColumnToWall(colIdx, targetSeg) {
+  if (!currentColumns) return;
+  const splits = effectiveWallSplits(currentColumns);
+  const nWalls = splits.length + 1;
+  if (targetSeg == null || isNaN(targetSeg) || targetSeg < 0 || targetSeg >= nWalls) return;
+  const curSeg = segmentOf(colIdx, splits);
+  if (curSeg === targetSeg) return;
+  const wallOf = currentColumns.map((_, i) => segmentOf(i, splits));
+  // 이동 컬럼을 제외하고 벽면별 버킷에 안정적으로 분배
+  const buckets = Array.from({ length: nWalls }, () => []);
+  currentColumns.forEach((col, i) => { if (i !== colIdx) buckets[wallOf[i]].push(col); });
+  buckets[targetSeg].push(currentColumns[colIdx]); // 타깃 벽면 끝에 배치
+  // 재조립 + 경계 재계산
+  const total = currentColumns.length;
+  const newCols = [];
+  let acc = 0; const rawSplits = [];
+  buckets.forEach((b, w) => {
+    for (const c of b) newCols.push(c);
+    acc += b.length;
+    if (w < nWalls - 1 && acc > 0 && acc < total) rawSplits.push(acc - 1);
+  });
+  currentColumns = newCols;
+  currentColumns.forEach((c, i) => c.idx = i);
+  wallSplits = rawSplits.filter((b, i, a) => a.indexOf(b) === i); // 빈 벽면으로 인한 중복 경계 제거
   refreshAllUI();
 }
 
